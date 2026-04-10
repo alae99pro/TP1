@@ -1,0 +1,134 @@
+-- ============================================================
+--  EXERCICE 1 : Atomicité d'une transaction
+-- ============================================================
+
+SET AUTOCOMMIT OFF;
+
+-- Q1 : Créer la table (S1)
+CREATE TABLE transaction (
+    idTransaction  VARCHAR2(44),
+    valTransaction NUMBER(10)
+);
+
+-- Q2 : Insertions, modification, suppression, ROLLBACK (S2)
+INSERT INTO transaction VALUES ('TX001', 100);
+INSERT INTO transaction VALUES ('TX002', 200);
+INSERT INTO transaction VALUES ('TX003', 300);
+UPDATE transaction SET valTransaction = 999 WHERE idTransaction = 'TX001';
+DELETE FROM transaction WHERE idTransaction = 'TX003';
+ROLLBACK;
+SELECT * FROM transaction;  -- Table vide
+
+-- Q3 : Insertion puis quit sans COMMIT (S2)
+INSERT INTO transaction VALUES ('TX010', 500);
+INSERT INTO transaction VALUES ('TX011', 600);
+quit;
+-- Depuis S1 : SELECT * FROM transaction; => table vide (ROLLBACK implicite)
+
+-- Q4 : Insertion puis fermeture brutale (S1)
+INSERT INTO transaction VALUES ('TX020', 1000);
+INSERT INTO transaction VALUES ('TX021', 2000);
+-- Fermer brutalement (Ctrl+C ou kill)
+-- Reconnexion : SELECT * FROM transaction; => table vide (ROLLBACK auto)
+
+-- Q5 : DDL provoque un COMMIT implicite
+INSERT INTO transaction VALUES ('TX030', 777);
+ALTER TABLE transaction ADD (val2transaction NUMBER(10));  -- COMMIT implicite avant et après
+ROLLBACK;  -- Ne peut pas annuler le DDL ni l'INSERT précédent
+SELECT * FROM transaction;  -- TX030 est présent, la colonne val2 existe
+
+
+-- ============================================================
+--  EXERCICE 2 : Transactions concurrentes
+-- ============================================================
+
+-- === CRÉATION DU SCHÉMA ===
+CREATE TABLE vol (
+    idVol                 VARCHAR2(44),
+    capaciteVol           NUMBER(10),
+    nbrPlacesReserveesVol NUMBER(10)
+);
+
+CREATE TABLE client (
+    idClient                 VARCHAR2(44),
+    prenomClient             VARCHAR2(11),
+    nbrPlacesReserveesCleint NUMBER(10)
+);
+
+INSERT INTO vol    VALUES ('V001', 100, 0);
+INSERT INTO client VALUES ('C001', 'Alice', 0);
+INSERT INTO client VALUES ('C002', 'Bob',   0);
+COMMIT;
+
+-- ================================================================
+-- ISOLATION : T1 modifie sans valider, T2 observe
+-- ================================================================
+-- T1 :
+UPDATE vol    SET nbrPlacesReserveesVol       = nbrPlacesReserveesVol + 2       WHERE idVol    = 'V001';
+UPDATE client SET nbrPlacesReserveesCleint    = nbrPlacesReserveesCleint + 2    WHERE idClient = 'C001';
+-- (pas de COMMIT)
+
+-- T2 :
+SELECT * FROM vol;    -- Affiche 0 (modifs de T1 invisibles)
+SELECT * FROM client; -- Affiche 0 pour Alice
+
+-- T1 :
+ROLLBACK;  -- La base revient à l'état initial pour tout le monde
+
+-- ================================================================
+-- LOST UPDATE : exécution alternée en READ COMMITTED
+-- ================================================================
+-- Étape 1 - Lectures T1 :
+T1> SELECT nbrPlacesReserveesVol    FROM vol    WHERE idVol    = 'V001';  -- 0
+T1> SELECT nbrPlacesReserveesCleint FROM client WHERE idClient = 'C001';  -- 0
+
+-- Étape 2 - Lectures T2 :
+T2> SELECT nbrPlacesReserveesVol    FROM vol    WHERE idVol    = 'V001';  -- 0
+T2> SELECT nbrPlacesReserveesCleint FROM client WHERE idClient = 'C002';  -- 0
+
+-- Étape 3 - Mises à jour et COMMIT T1 :
+T1> UPDATE vol    SET nbrPlacesReserveesVol      = 0 + 2 WHERE idVol    = 'V001';
+T1> UPDATE client SET nbrPlacesReserveesCleint   = 0 + 2 WHERE idClient = 'C001';
+T1> COMMIT;  -- vol = 2
+
+-- Étape 4 - Mises à jour et COMMIT T2 (écrase T1 sur vol !) :
+T2> UPDATE vol    SET nbrPlacesReserveesVol      = 0 + 3 WHERE idVol    = 'V001';
+T2> UPDATE client SET nbrPlacesReserveesCleint   = 0 + 3 WHERE idClient = 'C002';
+T2> COMMIT;  -- vol = 3 seulement (au lieu de 5 !)
+
+-- Vérification :
+SELECT * FROM vol;    -- nbrPlacesReserveesVol = 3 (incohérent !)
+SELECT * FROM client; -- Alice = 2, Bob = 3 (total 5, mais vol dit 3)
+
+-- ================================================================
+-- SERIALIZABLE : rejet du conflit
+-- ================================================================
+-- Réinitialisation
+UPDATE vol    SET nbrPlacesReserveesVol      = 0 WHERE idVol    = 'V001';
+UPDATE client SET nbrPlacesReserveesCleint   = 0 WHERE idClient = 'C001';
+UPDATE client SET nbrPlacesReserveesCleint   = 0 WHERE idClient = 'C002';
+COMMIT;
+
+-- Configurer les deux sessions
+ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;
+
+-- Même séquence alternée :
+T1> SELECT nbrPlacesReserveesVol FROM vol WHERE idVol = 'V001';  -- 0
+T2> SELECT nbrPlacesReserveesVol FROM vol WHERE idVol = 'V001';  -- 0
+T1> UPDATE vol SET nbrPlacesReserveesVol = 2 WHERE idVol = 'V001';
+T1> COMMIT;
+T2> UPDATE vol SET nbrPlacesReserveesVol = 3 WHERE idVol = 'V001';
+-- => ORA-08177: can't serialize access for this transaction
+T2> ROLLBACK;
+
+-- ================================================================
+-- SÉQUENCE DU COURS : r1(d) w2(d) w2(d') C2 w1(d') C1
+-- ================================================================
+T1> SELECT nbrPlacesReserveesVol FROM vol WHERE idVol = 'V001';         -- r1(d)
+T2> UPDATE vol SET nbrPlacesReserveesVol = 3 WHERE idVol = 'V001';      -- w2(d)
+T2> UPDATE client SET nbrPlacesReserveesCleint = 3 WHERE idClient='C002'; -- w2(d')
+T2> COMMIT;                                                               -- C2
+T1> UPDATE vol SET nbrPlacesReserveesVol = 2 WHERE idVol = 'V001';      -- w1(d')
+-- En SERIALIZABLE => ORA-08177 (T1 rejetée)
+-- En READ COMMITTED => succès (lost update)
+T1> COMMIT;                                                               -- C1
